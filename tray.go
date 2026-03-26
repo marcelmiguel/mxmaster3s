@@ -11,7 +11,7 @@ import (
 
 const (
 	pollIntervalFresh    = 30 * time.Minute // mouse awake  — fresh data
-	pollIntervalSleeping = 2 * time.Minute  // mouse asleep — retry sooner
+	pollIntervalSleeping = 30 * time.Second  // mouse asleep — retry frequently until it wakes
 )
 
 func main() {
@@ -72,11 +72,11 @@ func onReady() {
 		}
 
 		if info.Stale {
-			// Data is from Bolt receiver cache — mouse is sleeping, don't trust status
-			label := fmt.Sprintf("🔋 %d%%  — sleeping (cached)", info.Level)
-			mStatus.SetTitle(label)
-			systray.SetTooltip(fmt.Sprintf("MX Master 3S — %d%% (mouse sleeping)", info.Level))
-			systray.SetIcon(makeBatteryIcon(info.Level, false))
+			// Data is from Bolt receiver cache — mouse is sleeping.
+			// Don't show stale values; wait silently until the mouse wakes.
+			systray.SetIcon(makeBatteryIcon(0, false))
+			systray.SetTooltip("MX Master 3S — waiting for mouse...")
+			mStatus.SetTitle("⏳ Waiting for mouse to wake...")
 			return
 		}
 
