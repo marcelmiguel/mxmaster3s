@@ -1,3 +1,6 @@
+// Package main — MX Master 3S HID++ 2.0 battery detection (Windows).
+// This file contains only the HID++ protocol logic.
+// The program entry point is in tray.go.
 package main
 
 import (
@@ -27,7 +30,7 @@ const (
 // HID++ 2.0 constants
 const (
 	ReportLong = byte(0x11) // 20-byte long report
-	SoftwareID = byte(0x01) // arbitrary (1-15)
+	SoftwareID = byte(0x01) // arbitrary software ID (1-15)
 
 	BatStatusDischarging = byte(0)
 	BatStatusRecharging  = byte(1)
@@ -72,9 +75,17 @@ type hidCaps struct {
 	Reserved               [17]uint16
 }
 
-func main() {
-	fmt.Println("Scanning for MX Master 3S...")
+// BatteryInfo holds the result of a single battery scan.
+type BatteryInfo struct {
+	Found    bool   // false if device not present or unresponsive
+	Level    int    // 0-100 %
+	Status   string // human-readable status
+	Charging bool   // true when actively recharging or slow-charging
+	Stale    bool   // true when data comes from Bolt receiver cache (mouse sleeping)
+}
 
+// ScanMouse scans all connected HID devices and returns the MX Master 3S battery info.
+func ScanMouse() BatteryInfo {
 	var guid syscall.GUID
 	procHidGetHidGuid.Call(uintptr(unsafe.Pointer(&guid)))
 
@@ -106,7 +117,7 @@ func main() {
 		}
 
 		detailBuf := make([]byte, size)
-		*(*uint32)(unsafe.Pointer(&detailBuf[0])) = 8 // cbSize of SP_DEVICE_INTERFACE_DETAIL_DATA_W
+		*(*uint32)(unsafe.Pointer(&detailBuf[0])) = 8
 		procSetupDiGetDeviceInterfaceDetailW.Call(
 			hDevInfo, uintptr(unsafe.Pointer(&ifaceData[0])),
 			uintptr(unsafe.Pointer(&detailBuf[0])), uintptr(size),
@@ -125,7 +136,6 @@ func main() {
 			continue
 		}
 
-		// Filter: VID/PID must match MX Master 3S
 		attrs := hidAttrs{Size: 12}
 		procHidGetAttributes.Call(uintptr(h), uintptr(unsafe.Pointer(&attrs)))
 		if attrs.VendorID != LogitechVID ||
@@ -134,45 +144,28 @@ func main() {
 			continue
 		}
 
-		// Filter: vendor-specific usage page (HID++ 2.0)
 		var prep uintptr
 		procHidGetPreparsedData.Call(uintptr(h), uintptr(unsafe.Pointer(&prep)))
 		var caps hidCaps
 		procHidGetCaps.Call(prep, uintptr(unsafe.Pointer(&caps)))
 		procHidFreePreparsedData.Call(prep)
 
-		if caps.UsagePage < 0xFF00 {
+		if caps.UsagePage < 0xFF00 || caps.OutLen != 20 {
 			syscall.CloseHandle(h)
 			continue
 		}
 
-		// ── KEY FIX ──────────────────────────────────────────────────────────
-		// The Bolt receiver exposes TWO vendor-specific HID interfaces:
-		//   • Short-report  (OutLen = 7)  — does NOT handle long packets
-		//   • Long-report   (OutLen = 20) — the HID++ 2.0 command channel
-		// Only the long-report interface responds; the other blocks forever.
-		if caps.OutLen != 20 {
-			syscall.CloseHandle(h)
-			continue
-		}
-
-		fmt.Printf("Found MX Master 3S (VID=%04X PID=%04X) — reading battery...\n",
-			attrs.VendorID, attrs.ProductID)
-
-		if fetchBattery(h, attrs.ProductID) {
-			syscall.CloseHandle(h)
-			return
-		}
+		info := fetchBattery(h, attrs.ProductID)
 		syscall.CloseHandle(h)
+		if info.Found {
+			return info
+		}
 	}
-
-	fmt.Println("MX Master 3S not found or battery not available.")
+	return BatteryInfo{}
 }
 
 // hidppSendTimeout sends a HID++ 2.0 long report and waits for a matching
-// response for at most the given duration before cancelling.
-//
-// Packet layout: [reportId, devIdx, featIdx, funcIdx<<4|swId, params...]
+// response for at most the given duration before cancelling with CancelIoEx.
 func hidppSendTimeout(h syscall.Handle, devIdx, featIdx, funcIdx byte, params []byte, timeout time.Duration) ([]byte, bool) {
 	cmd := make([]byte, 20)
 	cmd[0] = ReportLong
@@ -193,9 +186,6 @@ func hidppSendTimeout(h syscall.Handle, devIdx, featIdx, funcIdx byte, params []
 		return nil, false
 	}
 
-	// Read in a goroutine so we can apply a timeout.
-	// If we time out we close the handle (caller's responsibility), which
-	// unblocks the goroutine's ReadFile call with an error — no goroutine leak.
 	type result struct {
 		data []byte
 		ok   bool
@@ -213,15 +203,13 @@ func hidppSendTimeout(h syscall.Handle, devIdx, featIdx, funcIdx byte, params []
 				0,
 			)
 			if r != 0 {
-				// Verify this packet is for our device and feature before accepting it.
-				// Format: [Report ID, DeviceIdx, FeatureIdx, ...] or [Report ID, DeviceIdx, 0x8F, FeatureIdx, ...]
+				// Discard packets that don't match our request
 				if res[0] == ReportLong && res[1] == devIdx {
 					if res[2] == featIdx || (res[2] == 0x8F && res[3] == featIdx) {
 						ch <- result{res, true}
 						return
 					}
 				}
-				// Otherwise, loop and read the next packet in the buffer
 			} else {
 				ch <- result{nil, false}
 				return
@@ -233,72 +221,59 @@ func hidppSendTimeout(h syscall.Handle, devIdx, featIdx, funcIdx byte, params []
 	case r := <-ch:
 		return r.data, r.ok
 	case <-time.After(timeout):
-		// Cancel the pending ReadFile operation
 		procCancelIoEx.Call(uintptr(h), 0)
 		return nil, false
 	}
 }
 
-// hidppSend is a convenience wrapper using a 500 ms timeout (fast scan for most requests).
+// hidppSend is a convenience wrapper using a 500 ms timeout (fast scan).
 func hidppSend(h syscall.Handle, devIdx, featIdx, funcIdx byte, params []byte) ([]byte, bool) {
 	return hidppSendTimeout(h, devIdx, featIdx, funcIdx, params, 500*time.Millisecond)
 }
 
-// fetchBattery tries device indices 0xFF (direct/BT) and 0x01-0x06 (Bolt receiver slots)
-// because the mouse might be paired to any slot on the receiver.
-func fetchBattery(h syscall.Handle, pid uint16) bool {
+// fetchBattery queries battery status on all Bolt receiver device slots and returns
+// the first successful result.
+func fetchBattery(h syscall.Handle, pid uint16) BatteryInfo {
 	devIndices := []byte{0xFF, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06}
 	if pid == PID_MX3S_BT {
 		devIndices = []byte{0xFF}
 	}
 
 	for _, devIdx := range devIndices {
-		// ── Step 1: Discover battery feature index ──
-		// Try 0x1004 (Unified Battery) first, then fallback to 0x1000 (Battery Status)
-		featureToTry := []uint16{0x1004, 0x1000}
+		// Step 1: discover runtime feature index — try 0x1004 then 0x1000
 		var batIdx byte
 		var usedFeature uint16
-
-		for _, feat := range featureToTry {
-			featHi := byte(feat >> 8)
-			featLo := byte(feat & 0xFF)
-			res, ok := hidppSend(h, devIdx, 0x00, 0x00, []byte{featHi, featLo})
-
-			if ok && res[2] != byte(0x8F) && res[4] != 0 {
+		for _, feat := range []uint16{0x1004, 0x1000} {
+			res, ok := hidppSend(h, devIdx, 0x00, 0x00, []byte{byte(feat >> 8), byte(feat)})
+			if ok && res[2] != 0x8F && res[4] != 0 {
 				batIdx = res[4]
 				usedFeature = feat
 				break
 			}
 		}
-
 		if batIdx == 0 {
-			fmt.Printf("  devIdx=0x%02X: battery features (0x1004/0x1000) not supported.\n", devIdx)
 			continue
 		}
 
 		if usedFeature == 0x1000 {
-			// ── Step 2: GetBatteryLevelStatus (featIdx=batIdx, func=0) ──
-			// WARNING: data returned here is the Bolt receiver's CACHED state — it
-			// may be stale if the mouse is in power-save mode. The status byte is
-			// especially unreliable; wake the mouse (move it) for accurate results.
+			// Step 2a: GetBatteryLevelStatus (func=0)
 			res, ok := hidppSend(h, devIdx, batIdx, 0x00, nil)
 			if !ok {
-				fmt.Printf("  devIdx=0x%02X: no response to battery query.\n", devIdx)
 				continue
 			}
-			level := res[4]
-			statusCode := res[6]
-			fmt.Printf("\n--- MX Master 3S Battery (cached — mouse is sleeping) ---\n")
-			fmt.Printf("Battery: %d%%\n", level)
-			fmt.Printf("Status:  %s (may be stale — move the mouse for live data)\n", statusText(statusCode))
-			return true
+			level := int(res[4])
+			sc := res[6]
+			return BatteryInfo{
+				Found:    true,
+				Level:    level,
+				Status:   statusText(sc),
+				Charging: sc == BatStatusRecharging || sc == BatStatusSlowCharge,
+				Stale:    true,
+			}
 		}
 
-		// ── 0x1004 Unified Battery ──────────────────────────────────────────
-		// The mouse may be asleep; the Bolt receiver must forward our packet
-		// and wait for it to wake, which can take 1–3 s.
-		// Retry up to 5 times with a 2-second timeout each attempt.
-		fmt.Printf("  devIdx=0x%02X: found 0x1004 (Unified Battery), waking mouse...\n", devIdx)
+		// Step 2b: 0x1004 Unified Battery — GetBatteryStatus (func=1)
+		// Retry up to 5× with 2 s each to wake sleeping mouse.
 		const maxRetries = 5
 		var res []byte
 		var ok bool
@@ -307,23 +282,17 @@ func fetchBattery(h syscall.Handle, pid uint16) bool {
 			if ok {
 				break
 			}
-			if attempt < maxRetries {
-				fmt.Printf("  devIdx=0x%02X: attempt %d/%d timed out, retrying...\n", devIdx, attempt, maxRetries)
-			}
 		}
 		if !ok {
-			fmt.Printf("  devIdx=0x%02X: mouse did not wake in time.\n", devIdx)
 			continue
 		}
 
-		// Unified Battery (0x1004) GetBatteryStatus response:
-		//   res[4] = charge   (%)
-		//   res[5] = flags    (bit 0 = wireless charging, bit 1 = wired charging)
-		//   res[6] = status   (0=discharge, 1=recharge, 2=almost full, 3=full, 4=slow, 5=invalid, 6=thermal err)
-		level := res[4]
-		statusRaw := res[6]
+		// 0x1004 response: res[4]=level%, res[6]=statusCode
+		// (0=discharge, 1=recharge, 2=almostFull, 3=full, 4=slowCharge, 5=invalid, 6=thermal)
+		level := int(res[4])
+		sr := res[6]
 		statusStr := "Unknown"
-		switch statusRaw {
+		switch sr {
 		case 0:
 			statusStr = "Discharging"
 		case 1:
@@ -339,12 +308,15 @@ func fetchBattery(h syscall.Handle, pid uint16) bool {
 		case 6:
 			statusStr = "Thermal Error"
 		}
-		fmt.Printf("\n--- MX Master 3S Battery ---\n")
-		fmt.Printf("Battery: %d%%\n", level)
-		fmt.Printf("Status:  %s\n", statusStr)
-		return true
+		return BatteryInfo{
+			Found:    true,
+			Level:    level,
+			Status:   statusStr,
+			Charging: sr == 1 || sr == 4,
+			Stale:    false,
+		}
 	}
-	return false
+	return BatteryInfo{}
 }
 
 func statusText(code byte) string {
